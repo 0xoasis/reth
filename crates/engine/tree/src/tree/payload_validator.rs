@@ -232,6 +232,11 @@ impl<'a, N: NodePrimitives> TreeCtx<'a, N> {
         self.canonical_in_memory_state
     }
 
+    /// Returns the pending sparse trie prune request, if any.
+    pub const fn sparse_trie_prune(&self) -> Option<&SparseTrieRetainedPaths> {
+        self.pending_sparse_trie_prune.as_ref()
+    }
+
     /// Takes the pending sparse trie prune request, if any.
     pub const fn take_sparse_trie_prune(&mut self) -> Option<SparseTrieRetainedPaths> {
         self.pending_sparse_trie_prune.take()
@@ -598,10 +603,11 @@ where
 
         // Spawn the appropriate processor based on strategy
         let pending_sparse_trie_prune = if matches!(strategy, StateRootStrategy::StateRootTask) {
-            ctx.take_sparse_trie_prune()
+            ctx.sparse_trie_prune().cloned()
         } else {
             None
         };
+        let should_consume_sparse_trie_prune = pending_sparse_trie_prune.is_some();
         let processor_options =
             PayloadProcessorSpawnOptions::new(parallel_bal_execution, pending_sparse_trie_prune);
         let mut handle = ensure_ok!(self.spawn_payload_processor(
@@ -998,6 +1004,10 @@ where
 
         if let Some(valid_block_tx) = valid_block_tx {
             let _ = valid_block_tx.send(());
+        }
+
+        if should_consume_sparse_trie_prune {
+            let _ = ctx.take_sparse_trie_prune();
         }
 
         let executed_block =

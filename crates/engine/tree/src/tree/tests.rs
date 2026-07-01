@@ -594,6 +594,23 @@ fn on_new_persisted_block_queues_sparse_trie_prune_request() {
 }
 
 #[test]
+fn sparse_trie_prune_request_can_be_peeked_before_successful_validation() {
+    let mut test_harness = TestHarness::new(MAINNET.clone());
+    test_harness.tree.pending_sparse_trie_prune = Some(Default::default());
+
+    let mut ctx = TreeCtx::new(
+        &mut test_harness.tree.state,
+        &test_harness.tree.canonical_in_memory_state,
+        &mut test_harness.tree.pending_sparse_trie_prune,
+    );
+
+    assert!(ctx.sparse_trie_prune().cloned().is_some());
+    assert!(ctx.sparse_trie_prune().is_some());
+    assert!(ctx.take_sparse_trie_prune().is_some());
+    assert!(ctx.sparse_trie_prune().is_none());
+}
+
+#[test]
 fn remove_blocks_clears_pending_sparse_trie_prune_request() {
     let mut test_harness = TestHarness::new(MAINNET.clone());
     test_harness.tree.persistence_state.last_persisted_block =

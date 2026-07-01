@@ -578,7 +578,7 @@ where
 }
 
 /// Account and storage paths that should survive sparse trie pruning.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 #[cfg(feature = "std")]
 pub struct SparseTrieRetainedPaths {
     account_paths: Vec<Nibbles>,
