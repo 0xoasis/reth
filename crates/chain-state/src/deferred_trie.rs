@@ -1,3 +1,4 @@
+use parking_lot::{Condvar, Mutex};
 use reth_metrics::{metrics::Counter, Metrics};
 use reth_trie::{
     prefix_set::TriePrefixSetsMut,
@@ -19,6 +20,10 @@ use tracing::{debug_span, instrument};
 pub struct DeferredTrieData {
     /// Shared deferred result populated by the corresponding [`DeferredTrieDataProducer`].
     value: Arc<OnceLock<ComputedTrieData>>,
+    /// Fallback inputs kept until the producer successfully publishes the computed trie data.
+    fallback_inputs: Arc<Mutex<Option<PendingInputs>>>,
+    /// Waiter state used to wake blocked callers if the producer finishes without publishing.
+    waiter: Arc<DeferredTrieWaiter>,
 }
 
 /// Producer consumed by a spawned task to compute sorted trie data for a [`DeferredTrieData`]
@@ -27,14 +32,16 @@ pub struct DeferredTrieData {
 pub struct DeferredTrieDataProducer {
     /// Shared result initialized exactly once by this producer.
     value: Arc<OnceLock<ComputedTrieData>>,
-    /// Unsorted inputs consumed when the producer computes trie data.
-    inputs: PendingInputs,
+    /// Fallback inputs shared with waiters until this producer publishes.
+    fallback_inputs: Arc<Mutex<Option<PendingInputs>>>,
+    /// Waiter state used to wake blocked callers when this producer finishes.
+    waiter: Arc<DeferredTrieWaiter>,
 }
 
 impl fmt::Debug for DeferredTrieDataProducer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeferredTrieDataProducer")
-            .field("inputs", &self.inputs)
+            .field("fallback_inputs", &self.fallback_inputs)
             .finish_non_exhaustive()
     }
 }
@@ -42,11 +49,23 @@ impl fmt::Debug for DeferredTrieDataProducer {
 impl DeferredTrieDataProducer {
     /// Computes sorted trie data, publishes it to waiters, and returns it to the task owner.
     pub fn compute_and_publish(self) -> ComputedTrieData {
-        let Self { value, inputs } = self;
+        let inputs = self
+            .fallback_inputs
+            .lock()
+            .clone()
+            .expect("deferred trie producer inputs should be available");
         let computed =
             DeferredTrieData::sort(inputs.hashed_state, inputs.trie_updates, inputs.changed_paths);
-        let _ = value.set(computed.clone());
+        let _ = self.value.set(computed.clone());
+        *self.fallback_inputs.lock() = None;
+        self.waiter.finish();
         computed
+    }
+}
+
+impl Drop for DeferredTrieDataProducer {
+    fn drop(&mut self) {
+        self.waiter.finish();
     }
 }
 
@@ -88,6 +107,31 @@ struct PendingInputs {
     changed_paths: Option<Arc<TriePrefixSetsMut>>,
 }
 
+#[derive(Debug, Default)]
+struct DeferredTrieWaiter {
+    producer_finished: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl DeferredTrieWaiter {
+    fn finished() -> Self {
+        Self { producer_finished: Mutex::new(true), condvar: Condvar::new() }
+    }
+
+    fn finish(&self) {
+        let mut producer_finished = self.producer_finished.lock();
+        *producer_finished = true;
+        self.condvar.notify_all();
+    }
+
+    fn wait_until_ready_or_finished(&self, value: &OnceLock<ComputedTrieData>) {
+        let mut producer_finished = self.producer_finished.lock();
+        while !*producer_finished && value.get().is_none() {
+            self.condvar.wait(&mut producer_finished);
+        }
+    }
+}
+
 impl fmt::Debug for DeferredTrieData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeferredTrieData")
@@ -104,18 +148,26 @@ impl DeferredTrieData {
         changed_paths: Option<Arc<TriePrefixSetsMut>>,
     ) -> (Self, DeferredTrieDataProducer) {
         let value = Arc::new(OnceLock::new());
+        let fallback_inputs =
+            Arc::new(Mutex::new(Some(PendingInputs { hashed_state, trie_updates, changed_paths })));
+        let waiter = Arc::new(DeferredTrieWaiter::default());
         (
-            Self { value: Arc::clone(&value) },
-            DeferredTrieDataProducer {
-                value,
-                inputs: PendingInputs { hashed_state, trie_updates, changed_paths },
+            Self {
+                value: Arc::clone(&value),
+                fallback_inputs: Arc::clone(&fallback_inputs),
+                waiter: Arc::clone(&waiter),
             },
+            DeferredTrieDataProducer { value, fallback_inputs, waiter },
         )
     }
 
     /// Create a handle that is already populated with the given [`ComputedTrieData`].
     pub fn ready(bundle: ComputedTrieData) -> Self {
-        Self { value: Arc::new(OnceLock::from(bundle)) }
+        Self {
+            value: Arc::new(OnceLock::from(bundle)),
+            fallback_inputs: Arc::new(Mutex::new(None)),
+            waiter: Arc::new(DeferredTrieWaiter::finished()),
+        }
     }
 
     /// Sorts block execution outputs.
@@ -167,7 +219,23 @@ impl DeferredTrieData {
             }
             None => {
                 DEFERRED_TRIE_METRICS.deferred_trie_task_wait.increment(1);
-                self.value.wait()
+                self.waiter.wait_until_ready_or_finished(&self.value);
+                match self.value.get() {
+                    Some(bundle) => bundle,
+                    None => {
+                        let Some(inputs) = self.fallback_inputs.lock().take() else {
+                            return self.value.wait().clone()
+                        };
+                        let computed = Self::sort(
+                            inputs.hashed_state,
+                            inputs.trie_updates,
+                            inputs.changed_paths,
+                        );
+                        let _ = self.value.set(computed.clone());
+                        self.waiter.finish();
+                        return computed
+                    }
+                }
             }
         };
 
@@ -201,6 +269,7 @@ mod tests {
     use reth_primitives_traits::Account;
     use reth_trie::{updates::TrieUpdates, HashedStorage};
     use std::{
+        sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
@@ -265,6 +334,28 @@ mod tests {
         assert!(Arc::ptr_eq(&published.hashed_state, &result.hashed_state));
         assert!(Arc::ptr_eq(&published.trie_updates, &result.trie_updates));
         assert_changed_paths_ptr_eq(&published.changed_paths, &result.changed_paths);
+    }
+
+    #[test]
+    fn pending_wait_falls_back_if_task_drops_before_publish() {
+        let changed_paths = Arc::new(TriePrefixSetsMut::default());
+        let (deferred, task) = DeferredTrieData::pending(
+            Arc::new(HashedPostState::default()),
+            Arc::new(TrieUpdates::default()),
+            Some(Arc::clone(&changed_paths)),
+        );
+        drop(task);
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = deferred.wait_cloned();
+            tx.send(result).unwrap();
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(1)).expect("wait should fall back");
+        assert_eq!(result.hashed_state.total_len(), 0);
+        assert_eq!(result.trie_updates.total_len(), 0);
+        assert_changed_paths_ptr_eq(&result.changed_paths, &Some(changed_paths));
     }
 
     #[test]
